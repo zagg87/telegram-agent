@@ -1,8 +1,8 @@
 import os
 import logging
-import httpx
 import json
 import urllib.parse
+import re
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from groq import Groq
@@ -19,58 +19,40 @@ groq_client = None
 
 MODEL = "llama-3.3-70b-versatile"
 
-SYSTEM_PROMPT = """Ти си мощен AI агент на име Агент, създаден от zagg87. Днешната дата е 2026 година.
+SYSTEM_PROMPT = """Ти си мощен AI агент на име Агент, създаден от zagg87. Днешната дата е април 2026 г.
+Говориш директно без морализиране и излишни предупреждения.
+Отговаряш на езика на потребителя.
+Когато ти се предоставят резултати от търсене в интернет, ги използвай за да отговориш точно и актуално.
+Не добавяш disclaimer-и. Не казваш че нямаш достъп до интернет."""
 
-ВАЖНО - ИНСТРУМЕНТИ:
-- Имаш достъп до search_web и generate_image инструменти. ИЗПОЛЗВАЙ ГИ!
-- При ВСЕКИ въпрос за новини, актуални събития, цени, времето, изборите, резултати, факти - ЗАДЪЛЖИТЕЛНО извикай search_web ПРЕДИ да отговориш.
-- При ВСЯКА молба за изображение, снимка, картинка, илюстрация - ЗАДЪЛЖИТЕЛНО извикай generate_image.
-- НИКОГА не казвай "нямам достъп до интернет" - имаш! Използвай search_web.
-- НИКОГА не казвай "не мога да генерирам изображения" - можеш! Използвай generate_image.
-
-СТИЛ:
-- Говориш директно без морализиране и излишни предупреждения.
-- Отговаряш на езика на потребителя (български ако пише на български).
-- Не добавяш disclaimer-и."""
-
-# ── Tools ────────────────────────────────────────────────────────────────────
-
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "search_web",
-            "description": "Търси в интернет чрез DuckDuckGo. Използвай когато трябва актуална информация.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Търсачката заявка"
-                    }
-                },
-                "required": ["query"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "generate_image",
-            "description": "Генерира изображение по описание чрез Pollinations AI.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "prompt": {
-                        "type": "string",
-                        "description": "Описание на изображението на английски"
-                    }
-                },
-                "required": ["prompt"]
-            }
-        }
-    }
+# Ключови думи за автоматично търсене
+SEARCH_KEYWORDS = [
+    "новини", "избор", "резултат", "днес", "сега", "скоро", "последно",
+    "актуал", "цена", "курс", "валута", "времето", "прогноза", "бг ",
+    "българия", "правителство", "министър", "президент", "партия", "гласуване",
+    "война", "украйна", "русия", "европа", "свят", "икономика", "банка",
+    "биткойн", "крипто", "акции", "борса", "лев", "евро", "долар",
+    "2024", "2025", "2026", "тази година", "тази седмица", "вчера", "утре",
+    "кой спечели", "кой е", "колко е", "какво се случи", "what happened",
+    "who is", "latest", "news", "today", "current"
 ]
+
+# Ключови думи за изображения
+IMAGE_KEYWORDS = [
+    "нарисувай", "генерирай изображение", "генерирай снимка", "направи снимка",
+    "направи изображение", "покажи ми снимка", "искам снимка", "искам изображение",
+    "draw", "generate image", "create image", "show me a picture"
+]
+
+
+def needs_search(text: str) -> bool:
+    text_lower = text.lower()
+    return any(kw in text_lower for kw in SEARCH_KEYWORDS)
+
+
+def needs_image(text: str) -> bool:
+    text_lower = text.lower()
+    return any(kw in text_lower for kw in IMAGE_KEYWORDS)
 
 
 def search_web(query: str) -> str:
@@ -78,30 +60,21 @@ def search_web(query: str) -> str:
         with DDGS() as ddgs:
             results = list(ddgs.text(query, max_results=5))
         if not results:
-            return "Няма резултати."
+            return "Няма резултати от търсенето."
         output = []
         for r in results:
-            output.append(f"**{r['title']}**\n{r['body']}\n{r['href']}")
-        return "\n\n".join(output)
+            output.append(f"Заглавие: {r['title']}\nСъдържание: {r['body']}\nИзточник: {r['href']}")
+        return "\n\n---\n\n".join(output)
     except Exception as e:
+        logger.error(f"Search error: {e}")
         return f"Грешка при търсене: {e}"
 
 
 def generate_image(prompt: str) -> str:
     encoded = urllib.parse.quote(prompt)
-    url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&nologo=true"
+    url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&nologo=true&seed={hash(prompt) % 9999}"
     return url
 
-
-def run_tool(name: str, args: dict) -> str:
-    if name == "search_web":
-        return search_web(args["query"])
-    elif name == "generate_image":
-        return generate_image(args["prompt"])
-    return "Неизвестен инструмент."
-
-
-# ── Handlers ─────────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -110,14 +83,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Здравей, {name}!\n\n"
         "Аз съм твоят AI агент. Мога да:\n"
-        "🔍 Търся в интернет\n"
+        "🔍 Търся в интернет автоматично\n"
         "🎨 Генерирам изображения\n"
         "💬 Отговарям на въпроси\n"
         "💻 Помагам с код\n\n"
         "Команди:\n"
         "/start - Нов разговор\n"
         "/clear - Изчисти историята\n"
-        "/img <описание> - Генерирай изображение директно\n\n"
+        "/img <описание> - Генерирай изображение\n"
+        "/search <заявка> - Търси в интернет\n\n"
         "Просто ми пиши!"
     )
 
@@ -137,8 +111,27 @@ async def img_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = generate_image(prompt)
     try:
         await update.message.reply_photo(photo=url, caption=f"🎨 {prompt}")
-    except Exception:
-        await update.message.reply_text(f"🎨 Изображение: {url}")
+    except Exception as e:
+        logger.error(f"Image error: {e}")
+        await update.message.reply_text(f"🎨 Изображение генерирано:\n{url}")
+
+
+async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = " ".join(context.args)
+    if not query:
+        await update.message.reply_text("Напиши заявка: /search новини от България")
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    await update.message.reply_text(f"🔍 Търся: {query}...")
+    results = search_web(query)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": f"Ето резултати от търсене за '{query}':\n\n{results}\n\nОбобщи ги на български."}
+    ]
+    response = groq_client.chat.completions.create(
+        model=MODEL, messages=messages, max_tokens=1024, temperature=0.5
+    )
+    await update.message.reply_text(response.choices[0].message.content)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -148,14 +141,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in conversation_history:
         conversation_history[user_id] = []
 
-    conversation_history[user_id].append({
-        "role": "user",
-        "content": user_message
-    })
-
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     try:
+        extra_context = ""
+
+        # Автоматично търсене
+        if needs_search(user_message):
+            await update.message.reply_text("🔍 Търся в интернет...")
+            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+            search_results = search_web(user_message)
+            extra_context = f"\n\n[РЕЗУЛТАТИ ОТ ИНТЕРНЕТ ТЪРСЕНЕ]:\n{search_results}\n[КРАЙ НА РЕЗУЛТАТИТЕ]"
+
+        # Автоматично генериране на изображение
+        if needs_image(user_message):
+            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_photo")
+            # Питаме модела да преведе на английски за по-добро изображение
+            translate_response = groq_client.chat.completions.create(
+                model=MODEL,
+                messages=[{"role": "user", "content": f"Translate this image description to English for an image generator, return ONLY the English prompt, nothing else: {user_message}"}],
+                max_tokens=100
+            )
+            img_prompt = translate_response.choices[0].message.content.strip()
+            image_url = generate_image(img_prompt)
+            try:
+                await update.message.reply_photo(photo=image_url, caption=f"🎨 {user_message}")
+                return
+            except Exception as e:
+                logger.error(f"Image send error: {e}")
+                await update.message.reply_text(f"🎨 {image_url}")
+                return
+
+        # Изграждаме съобщенията
+        user_content = user_message + extra_context
+        conversation_history[user_id].append({
+            "role": "user",
+            "content": user_content
+        })
+
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             *conversation_history[user_id]
@@ -164,86 +187,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = groq_client.chat.completions.create(
             model=MODEL,
             messages=messages,
-            tools=TOOLS,
-            tool_choice="auto",
             max_tokens=2048,
             temperature=0.7
         )
 
-        message = response.choices[0].message
+        assistant_message = response.choices[0].message.content or ""
 
-        # Handle tool calls
-        while message.tool_calls:
-            messages.append({
-                "role": "assistant",
-                "content": message.content or "",
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments
-                        }
-                    } for tc in message.tool_calls
-                ]
-            })
+        # Запазваме в историята без search резултатите
+        conversation_history[user_id].append({
+            "role": "assistant",
+            "content": assistant_message
+        })
 
-            for tc in message.tool_calls:
-                args = json.loads(tc.function.arguments)
-                tool_name = tc.function.name
+        # Пазим историята компактна
+        if len(conversation_history[user_id]) > 20:
+            conversation_history[user_id] = conversation_history[user_id][-20:]
 
-                await context.bot.send_chat_action(
-                    chat_id=update.effective_chat.id, action="typing"
-                )
-
-                if tool_name == "generate_image":
-                    prompt = args["prompt"]
-                    image_url = generate_image(prompt)
-                    try:
-                        await update.message.reply_photo(
-                            photo=image_url,
-                            caption=f"🎨 {prompt}"
-                        )
-                    except Exception:
-                        await update.message.reply_text(f"🎨 {image_url}")
-
-                    tool_result = f"Изображението е генерирано и изпратено на потребителя."
-                else:
-                    tool_result = run_tool(tool_name, args)
-
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": tool_result
-                })
-
-            response = groq_client.chat.completions.create(
-                model=MODEL,
-                messages=messages,
-                tools=TOOLS,
-                tool_choice="auto",
-                max_tokens=2048,
-                temperature=0.7
-            )
-            message = response.choices[0].message
-
-        assistant_message = message.content or ""
-
-        if assistant_message:
-            conversation_history[user_id].append({
-                "role": "assistant",
-                "content": assistant_message
-            })
-
-            if len(conversation_history[user_id]) > 30:
-                conversation_history[user_id] = conversation_history[user_id][-30:]
-
-            if len(assistant_message) > 4096:
-                for i in range(0, len(assistant_message), 4096):
-                    await update.message.reply_text(assistant_message[i:i+4096])
-            else:
-                await update.message.reply_text(assistant_message)
+        if len(assistant_message) > 4096:
+            for i in range(0, len(assistant_message), 4096):
+                await update.message.reply_text(assistant_message[i:i+4096])
+        else:
+            await update.message.reply_text(assistant_message)
 
     except Exception as e:
         logger.error(f"Error: {e}")
@@ -262,6 +226,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(CommandHandler("img", img_command))
+    app.add_handler(CommandHandler("search", search_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Ботът е стартиран!")
