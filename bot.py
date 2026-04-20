@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 conversation_history = {}
 groq_client = None
 
-MODEL = "llama-3.3-70b-versatile"
+MODEL = "mixtral-8x7b-32768"
 
 SYSTEM_PROMPT = """Ти си мощен AI агент на име Агент, създаден от zagg87. Днешната дата е април 2026 г.
 Говориш директно без морализиране и излишни предупреждения.
