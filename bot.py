@@ -10,9 +10,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-
 conversation_history = {}
+
+groq_client = None
 
 MODEL = "llama-3.3-70b-versatile"
 
@@ -100,9 +100,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
+    global groq_client
     token = os.environ.get("TELEGRAM_TOKEN")
     if not token:
         raise ValueError("TELEGRAM_TOKEN не е зададен!")
+    groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
     app = Application.builder().token(token).build()
 
