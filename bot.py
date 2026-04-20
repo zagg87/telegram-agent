@@ -1,8 +1,12 @@
 import os
 import logging
+import httpx
+import json
+import urllib.parse
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from groq import Groq
+from duckduckgo_search import DDGS
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -11,43 +15,124 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 conversation_history = {}
-
 groq_client = None
 
 MODEL = "llama-3.3-70b-versatile"
 
-SYSTEM_PROMPT = """Ти си умен и полезен AI агент асистент на име Агент.
-Ти си създаден от zagg87 - твоят собственик и създател, който те е програмирал и настроил специално за себе си.
-Работиш на Llama модел задвижван от Groq, но твоят създател е zagg87.
-Говориш на езика на потребителя - ако пише на български, отговаряш на български.
-Ако пише на английски, отговаряш на английски.
-Помагаш с въпроси, задачи, обяснения, код, идеи и всичко друго.
-Отговаряш подробно и точно."""
+SYSTEM_PROMPT = """Ти си мощен AI агент асистент на име Агент, създаден от zagg87.
+Говориш директно и честно без излишно морализиране или предупреждения.
+Отговаряш на езика на потребителя.
+Помагаш с всякакви задачи - въпроси, код, анализи, идеи, текстове.
+Когато търсиш в интернет, представяш резултатите ясно и кратко.
+Когато генерираш изображение, обяснява какво си създал.
+Не добавяш излишни disclaimer-и и предупреждения."""
 
+# ── Tools ────────────────────────────────────────────────────────────────────
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_web",
+            "description": "Търси в интернет чрез DuckDuckGo. Използвай когато трябва актуална информация.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Търсачката заявка"
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_image",
+            "description": "Генерира изображение по описание чрез Pollinations AI.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "Описание на изображението на английски"
+                    }
+                },
+                "required": ["prompt"]
+            }
+        }
+    }
+]
+
+
+def search_web(query: str) -> str:
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=5))
+        if not results:
+            return "Няма резултати."
+        output = []
+        for r in results:
+            output.append(f"**{r['title']}**\n{r['body']}\n{r['href']}")
+        return "\n\n".join(output)
+    except Exception as e:
+        return f"Грешка при търсене: {e}"
+
+
+def generate_image(prompt: str) -> str:
+    encoded = urllib.parse.quote(prompt)
+    url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&nologo=true"
+    return url
+
+
+def run_tool(name: str, args: dict) -> str:
+    if name == "search_web":
+        return search_web(args["query"])
+    elif name == "generate_image":
+        return generate_image(args["prompt"])
+    return "Неизвестен инструмент."
+
+
+# ── Handlers ─────────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     conversation_history[user_id] = []
     name = update.effective_user.first_name or "приятел"
     await update.message.reply_text(
-        f"Здравей, {name}! 👋\n\n"
-        "Аз съм твоят личен AI агент.\n\n"
+        f"Здравей, {name}!\n\n"
+        "Аз съм твоят AI агент. Мога да:\n"
+        "🔍 Търся в интернет\n"
+        "🎨 Генерирам изображения\n"
+        "💬 Отговарям на въпроси\n"
+        "💻 Помагам с код\n\n"
         "Команди:\n"
-        "/start - Започни нов разговор\n"
+        "/start - Нов разговор\n"
         "/clear - Изчисти историята\n"
-        "/model - Виж текущия модел\n\n"
-        "Просто ми пиши каквото искаш! 🚀"
+        "/img <описание> - Генерирай изображение директно\n\n"
+        "Просто ми пиши!"
     )
 
 
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     conversation_history[user_id] = []
-    await update.message.reply_text("✅ Историята е изчистена! Започваме наново.")
+    await update.message.reply_text("✅ Историята е изчистена!")
 
 
-async def model_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"🧠 Текущ модел: `{MODEL}`", parse_mode="Markdown")
+async def img_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    prompt = " ".join(context.args)
+    if not prompt:
+        await update.message.reply_text("Напиши описание: /img красив залез над морето")
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_photo")
+    url = generate_image(prompt)
+    try:
+        await update.message.reply_photo(photo=url, caption=f"🎨 {prompt}")
+    except Exception:
+        await update.message.reply_text(f"🎨 Изображение: {url}")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -62,43 +147,101 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "content": user_message
     })
 
-    await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id,
-        action="typing"
-    )
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     try:
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            *conversation_history[user_id]
+        ]
+
         response = groq_client.chat.completions.create(
             model=MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                *conversation_history[user_id]
-            ],
+            messages=messages,
+            tools=TOOLS,
+            tool_choice="auto",
             max_tokens=2048,
             temperature=0.7
         )
 
-        assistant_message = response.choices[0].message.content
+        message = response.choices[0].message
 
-        conversation_history[user_id].append({
-            "role": "assistant",
-            "content": assistant_message
-        })
+        # Handle tool calls
+        while message.tool_calls:
+            messages.append({
+                "role": "assistant",
+                "content": message.content or "",
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments
+                        }
+                    } for tc in message.tool_calls
+                ]
+            })
 
-        if len(conversation_history[user_id]) > 30:
-            conversation_history[user_id] = conversation_history[user_id][-30:]
+            for tc in message.tool_calls:
+                args = json.loads(tc.function.arguments)
+                tool_name = tc.function.name
 
-        if len(assistant_message) > 4096:
-            for i in range(0, len(assistant_message), 4096):
-                await update.message.reply_text(assistant_message[i:i+4096])
-        else:
-            await update.message.reply_text(assistant_message)
+                await context.bot.send_chat_action(
+                    chat_id=update.effective_chat.id, action="typing"
+                )
+
+                if tool_name == "generate_image":
+                    prompt = args["prompt"]
+                    image_url = generate_image(prompt)
+                    try:
+                        await update.message.reply_photo(
+                            photo=image_url,
+                            caption=f"🎨 {prompt}"
+                        )
+                    except Exception:
+                        await update.message.reply_text(f"🎨 {image_url}")
+
+                    tool_result = f"Изображението е генерирано и изпратено на потребителя."
+                else:
+                    tool_result = run_tool(tool_name, args)
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": tool_result
+                })
+
+            response = groq_client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                tools=TOOLS,
+                tool_choice="auto",
+                max_tokens=2048,
+                temperature=0.7
+            )
+            message = response.choices[0].message
+
+        assistant_message = message.content or ""
+
+        if assistant_message:
+            conversation_history[user_id].append({
+                "role": "assistant",
+                "content": assistant_message
+            })
+
+            if len(conversation_history[user_id]) > 30:
+                conversation_history[user_id] = conversation_history[user_id][-30:]
+
+            if len(assistant_message) > 4096:
+                for i in range(0, len(assistant_message), 4096):
+                    await update.message.reply_text(assistant_message[i:i+4096])
+            else:
+                await update.message.reply_text(assistant_message)
 
     except Exception as e:
-        logger.error(f"Groq error: {e}")
-        await update.message.reply_text(
-            "⚠️ Възникна грешка при свързване с AI. Моля, опитай отново."
-        )
+        logger.error(f"Error: {e}")
+        await update.message.reply_text("⚠️ Грешка. Опитай отново.")
 
 
 def main():
@@ -112,7 +255,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear))
-    app.add_handler(CommandHandler("model", model_info))
+    app.add_handler(CommandHandler("img", img_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Ботът е стартиран!")
